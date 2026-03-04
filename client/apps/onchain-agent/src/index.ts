@@ -138,6 +138,7 @@ async function createRuntimeServices(
     manifest as any,
     config.gameName,
     tokenConfig,
+    config.toriiUrl,
   );
   return { client, account, session, adapter };
 }

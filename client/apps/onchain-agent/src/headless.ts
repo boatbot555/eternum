@@ -408,6 +408,7 @@ export async function mainHeadless(options: CliOptions): Promise<void> {
     artifacts.manifest as any,
     config.gameName,
     tokenConfig,
+    config.toriiUrl,
   );
   const mutableAdapter = new MutableGameAdapter(adapter);
 

@@ -47,6 +47,7 @@ export interface EternumEntity {
   guardSlots?: { slot: string; troops: string }[];
   resources?: Map<string, number>;
   productionBuildings?: string[];
+  producedResourceIds?: number[]; // Resource IDs with active production buildings (for smart automation)
   buildingSlots?: { used: number; total: number; buildings: string[] };
   population?: { current: number; capacity: number };
   nextUpgrade?: { name: string; cost: string } | null; // null = max level
@@ -718,20 +719,12 @@ function buildOperatingArea(
     }
   }
 
-  const lines: string[] = [
-    `### Operating Area (radius ${OPERATING_AREA_RADIUS} around all entities, ${areaTiles.size} tiles)`,
-  ];
-  if (unexplored.length > 0) {
-    lines.push(`  Unexplored (${unexplored.length}): ${unexplored.join(", ")}`);
-  }
+  const lines: string[] = [`### Operating Area`];
   if (enemyStructures.length > 0) {
     lines.push(`  Structures: ${enemyStructures.join(", ")}`);
   }
   if (enemyArmies.length > 0) {
     lines.push(`  Armies: ${enemyArmies.join(", ")}`);
-  }
-  if (exploredEmpty.length > 0) {
-    lines.push(`  Explored tiles: ${exploredEmpty.join(", ")}`);
   }
   lines.push(`  Biome affects combat ±30%. Check tile biome before attacking.`);
   return lines.join("\n");
@@ -870,10 +863,8 @@ export async function buildWorldState(client: EternumClient, accountAddress: str
     }
   }
 
-  // 3. Filter to entities within VIEW_RADIUS of any owned position.
-  const nearbyRawStructures = rawStructures.filter((s) =>
-    nearAnyOwned({ x: Number(s.coord_x ?? 0), y: Number(s.coord_y ?? 0) }, ownedPositions),
-  );
+  // 3. Show ALL structures (agent needs full map awareness); filter armies to nearby only.
+  const nearbyRawStructures = rawStructures;
   const nearbyRawArmies = rawArmies.filter((a) =>
     nearAnyOwned({ x: Number(a.coord_x ?? 0), y: Number(a.coord_y ?? 0) }, ownedPositions),
   );
@@ -1012,6 +1003,7 @@ export async function buildWorldState(client: EternumClient, accountAddress: str
 
         const entityResources = new Map<string, number>();
         const buildings: string[] = [];
+        const producedResourceIds: number[] = [];
 
         for (const col of RESOURCE_BALANCE_COLUMNS) {
           const prodPrefix = col.column.replace("_BALANCE", "_PRODUCTION");
@@ -1027,6 +1019,7 @@ export async function buildWorldState(client: EternumClient, accountAddress: str
           const buildingCount = Number(row[`${prodPrefix}.building_count`] ?? 0);
           if (buildingCount > 0) {
             buildings.push(`${col.name} x${buildingCount}`);
+            producedResourceIds.push(col.resourceId);
           }
         }
 
@@ -1044,6 +1037,7 @@ export async function buildWorldState(client: EternumClient, accountAddress: str
 
         entity.resources = entityResources;
         entity.productionBuildings = buildings.length > 0 ? buildings : undefined;
+        entity.producedResourceIds = producedResourceIds.length > 0 ? producedResourceIds : undefined;
         entity.troopsInReserve = troopReserves.length > 0 ? troopReserves : undefined;
       }
 
@@ -1221,7 +1215,35 @@ export async function buildWorldState(client: EternumClient, accountAddress: str
 // Tick prompt formatter — human-readable world state for the agent
 // ---------------------------------------------------------------------------
 
-function formatEntityLine(e: EternumEntity, ownedEntities?: EternumEntity[]): string {
+/**
+ * Format the 6 adjacent tiles of an explorer so the agent can see what's around it.
+ * Each tile shows: direction, display coords, biome (or "unexplored"), and any occupier.
+ */
+function formatExplorerNeighbors(
+  e: EternumEntity,
+  tileMap: Map<string, { biome: number; occupierType: number; occupierId: number }>,
+): string {
+  const neighbors = getNeighborHexes(e.position.x, e.position.y);
+  const parts: string[] = [];
+  for (const n of neighbors) {
+    const tile = tileMap.get(`${n.col},${n.row}`);
+    const pos = fmtPos(n.col, n.row);
+    const biome = tile && tile.biome !== 0 ? biomeName(tile.biome) : "unexplored";
+    const occ =
+      tile && tile.occupierType !== 0
+        ? ` [${occupierName(tile.occupierType)}#${tile.occupierId}]`
+        : "";
+    // Direction enum value so agent can reference it for move_to
+    parts.push(`dir${n.direction}=${pos}(${biome}${occ})`);
+  }
+  return parts.join(" ");
+}
+
+function formatEntityLine(
+  e: EternumEntity,
+  ownedEntities?: EternumEntity[],
+  tileMap?: Map<string, { biome: number; occupierType: number; occupierId: number }>,
+): string {
   const rel = ownedEntities ? " " + computeRelativeLabel(e.position.x, e.position.y, ownedEntities) : "";
   if (e.type === "structure") {
     const guard = e.guardSummary
@@ -1237,7 +1259,9 @@ function formatEntityLine(e: EternumEntity, ownedEntities?: EternumEntity[]): st
   const owner = e.isOwned ? "MINE" : e.ownerName || shortAddr(e.owner);
   const troops = e.troopSummary ?? "no troops";
   const battle = e.isInBattle ? " IN BATTLE" : "";
-  return `  [Army] id=${e.entityId} ${troops} str=${fmtNum(e.strength ?? 0)} stam=${fmtNum(e.stamina ?? 0)} owner=${owner} pos=${fmtPos(e.position.x, e.position.y)}${battle}${rel}`;
+  const neighborStr =
+    e.isOwned && tileMap ? `\n    adjacent: ${formatExplorerNeighbors(e, tileMap)}` : "";
+  return `  [Army] id=${e.entityId} ${troops} str=${fmtNum(e.strength ?? 0)} stam=${fmtNum(e.stamina ?? 0)} owner=${owner} pos=${fmtPos(e.position.x, e.position.y)}${battle}${rel}${neighborStr}`;
 }
 
 /** Format a unix timestamp as a relative time string like "5m ago" or "2h ago". */
@@ -1454,7 +1478,7 @@ export function formatEternumTickDiff(state: EternumWorldState, prevState: Etern
     for (const r of aDiff.removed) lines.push(`  - [Army] id=${r.entityId} ${r.troopSummary ?? ""} (destroyed/left)`);
 
     if (myStructures.length > 0) {
-      lines.push(`Structures (actions: ${getStructureActions().join(", ")})`);
+      lines.push(`Structures (actions: ${getStructureActions().join(", ")}, run_smart_production)`);
       for (const e of myStructures) {
         const changes = structureChangeMap.get(e.entityId);
         const tag = addedStructureIds.has(e.entityId) ? " ← NEW" : changes ? ` ← ${changes.join(" | ")}` : "";
@@ -1516,7 +1540,7 @@ export function formatEternumTickDiff(state: EternumWorldState, prevState: Etern
       for (const e of myArmies) {
         const changes = armyChangeMap.get(e.entityId);
         const tag = addedArmyIds.has(e.entityId) ? " ← NEW" : changes ? ` ← ${changes.join(" | ")}` : "";
-        lines.push(`${formatEntityLine(e, myStructures)}${tag}`);
+        lines.push(`${formatEntityLine(e, myStructures, state.tileMap)}${tag}`);
         if (e.lastAttack) {
           const ago = formatTimeAgo(e.lastAttack.timestamp);
           const pos = e.lastAttack.pos ? ` from ${fmtPos(e.lastAttack.pos.x, e.lastAttack.pos.y)}` : "";
@@ -1618,6 +1642,12 @@ export function formatEternumTickDiff(state: EternumWorldState, prevState: Etern
     );
   }
 
+  // Instructions — same as full prompt
+  sections.push(`### Actions
+1. Review your entities above — available actions are listed per section (Structures, Armies)
+2. Use \`execute_action\` to act (use \`list_actions\` to look up params)
+3. Update your task files and learnings as needed`);
+
   const result = sections.join("\n\n");
 
   // Debug log
@@ -1672,7 +1702,7 @@ export function formatEternumTickPrompt(state: EternumWorldState): string {
   if (myStructures.length > 0 || myArmies.length > 0) {
     const lines = ["### My Entities"];
     if (myStructures.length > 0) {
-      lines.push(`Structures (actions: ${getStructureActions().join(", ")})`);
+      lines.push(`Structures (actions: ${getStructureActions().join(", ")}, run_smart_production)`);
       for (const e of myStructures) {
         lines.push(formatEntityLine(e));
         // Per-structure resources (skip zero/empty)
@@ -1739,7 +1769,7 @@ export function formatEternumTickPrompt(state: EternumWorldState): string {
     if (myArmies.length > 0) {
       lines.push(`Armies (actions: ${getArmyActions().join(", ")})`);
       for (const e of myArmies) {
-        lines.push(formatEntityLine(e, myStructures));
+        lines.push(formatEntityLine(e, myStructures, state.tileMap));
         // Last attack/defense on this army
         if (e.lastAttack) {
           const ago = formatTimeAgo(e.lastAttack.timestamp);

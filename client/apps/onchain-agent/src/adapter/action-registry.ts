@@ -14,9 +14,9 @@ import type { Account } from "starknet";
 import { generateActions, mergeCompositeActions } from "../abi/action-gen";
 import { createABIExecutor, type ABIExecutor } from "../abi/executor";
 import { ETERNUM_OVERLAYS, createHiddenOverlays, num, bool, numArray, precisionAmount } from "../abi/domain-overlay";
-import { getDirectionBetweenAdjacentHexes, packTileSeed } from "@bibliothecadao/types";
+import { getDirectionBetweenAdjacentHexes, getNeighborHexes, packTileSeed } from "@bibliothecadao/types";
 import type { Manifest } from "../abi/types";
-// move-executor removed (pathfinder removed)
+import { runSmartProduction } from "./smart-production";
 import { buildWorldState, type EternumWorldState, toContract, toDisplay, getMapCenter } from "./world-state";
 
 // ---------------------------------------------------------------------------
@@ -27,6 +27,7 @@ let _executor: ABIExecutor | undefined;
 let _actionDefs: ActionDefinition[] = [];
 let _actionTypes = new Set<string>();
 let _initialized = false;
+let _toriiSqlUrl: string | undefined;
 
 /** Token addresses from world profile, used by approve_token action. */
 export interface TokenConfig {
@@ -95,9 +96,10 @@ function logAction(actionType: string, result: ActionResult) {
 export function initializeActions(
   manifest: Manifest,
   account: Account,
-  options: { gameName?: string; tokenConfig?: TokenConfig } = {},
+  options: { gameName?: string; tokenConfig?: TokenConfig; toriiSqlUrl?: string } = {},
 ) {
   _tokenConfig = options.tokenConfig ?? {};
+  if (options.toriiSqlUrl) _toriiSqlUrl = options.toriiSqlUrl;
 
   // Build overlays (domain enrichments + hidden admin entrypoints)
   const hiddenOverlays = createHiddenOverlays(manifest);
@@ -133,23 +135,24 @@ export function initializeActions(
   const withComposites = mergeCompositeActions(generated, [
     {
       definition: {
-        type: "move_to",
+        type: "explorer_move",
         description:
-          "Move an explorer to a target coordinate using A* pathfinding. Automatically computes the optimal path, " +
-          "batches travel/explore actions, and executes them sequentially. Stops on first failure.",
+          "Move an explorer one tile in a direction (0-5). The world state shows each explorer's 6 adjacent tiles " +
+          "as 'dir0=(x,y)(biome) dir1=...' — pick the direction number for the tile you want. " +
+          "Automatically uses VRF for unexplored tiles and simple travel for explored tiles.",
         params: [
-          { name: "explorerId", type: "number", description: "Explorer entity ID to move", required: true },
+          { name: "explorer_id", type: "number", description: "Explorer entity ID", required: true },
           {
-            name: "targetCol",
+            name: "direction",
             type: "number",
-            description: "Target column (x) — use the display coordinates shown in world state",
+            description: "Direction to move: 0-5 (shown as dirN= in world state adjacent tile list)",
             required: true,
           },
           {
-            name: "targetRow",
-            type: "number",
-            description: "Target row (y) — use the display coordinates shown in world state",
-            required: true,
+            name: "explore",
+            type: "boolean",
+            description: "Optional override. Default: auto-detected (true if tile is unexplored, false if explored)",
+            required: false,
           },
         ],
       },
@@ -212,15 +215,51 @@ export function initializeActions(
         ],
       },
     },
+    {
+      definition: {
+        type: "run_smart_production",
+        description:
+          "Run smart production automation for a realm — covers ALL production buildings (Wood Mill, Copper Mine, " +
+          "Coal Mine, Gold Mine, Ironwood Grove, troop buildings, etc). Queues burn cycles for every resource " +
+          "the realm produces: T1 resources (Wood=3, Coal=2, Copper=4) first via labor, then T2/T3 via resource " +
+          "conversion, then armies (Knight=26, Crossbowman=29, Paladin=32, etc), then Donkey=25. " +
+          "Calls burn_resource_for_resource_production and/or burn_labor_for_resource_production as needed. " +
+          "Call this EVERY tick to keep all production buildings running.",
+        params: [
+          {
+            name: "realmEntityId",
+            type: "number",
+            description: "Realm entity ID to run production for",
+            required: true,
+          },
+          {
+            name: "producedResourceIds",
+            type: "number[]",
+            description:
+              "Optional override — leave blank and it auto-detects from world state. " +
+              "Only set this if you want to override which resources get queued.",
+            required: false,
+          },
+          {
+            name: "cyclesPerResource",
+            type: "number",
+            description: "Production cycles to queue per resource (default: 5). More cycles = more output per call.",
+            required: false,
+          },
+        ],
+      },
+    },
   ]);
 
   _actionDefs = withComposites.definitions;
   _actionTypes = new Set(withComposites.routes.keys());
-  _actionTypes.delete("explorer_move"); // Hidden — use move_to instead (handles VRF)
-  _actionTypes.add("move_to"); // Not in routes (composite)
+  // explorer_move is our composite handler (replaces raw ABI explorer_move with VRF support)
+  _actionTypes.delete("explorer_move"); // Remove ABI version — re-added as composite below
+  _actionTypes.add("explorer_move");    // Composite with VRF auto-detect
   _actionTypes.add("approve_token"); // Not in routes (composite)
   _actionTypes.add("lock_entry_token"); // Not in routes (composite)
   _actionTypes.add("settle_blitz_realm"); // Not in routes (composite)
+  _actionTypes.add("run_smart_production"); // Not in routes (composite)
 
   // Create ABI executor for standard actions
   _executor = createABIExecutor(manifest, account, {
@@ -233,10 +272,10 @@ export function initializeActions(
 }
 
 // ---------------------------------------------------------------------------
-// move_to handler (composite action)
+// explorer_move handler — move one tile by direction number (shown in world state adjacent tiles)
 // ---------------------------------------------------------------------------
 
-async function handleMoveTo(
+async function handleExplorerMove(
   client: EternumClient,
   signer: Account,
   params: Record<string, unknown>,
@@ -246,55 +285,74 @@ async function handleMoveTo(
   }
 
   try {
-  const explorerId = num(params.explorerId);
-  const displayCol = num(params.targetCol);
-  const displayRow = num(params.targetRow);
-  const explore = bool(params.explore !== undefined ? params.explore : true);
+    // Parse explorer_id — strip any non-numeric prefix (e.g. "army#1119" → 1119, "#1119" → 1119)
+    const rawId = String(params.explorer_id ?? params.explorerId ?? "");
+    const explorerId = parseInt(rawId.replace(/[^0-9]/g, ""), 10);
+    if (isNaN(explorerId)) {
+      return { success: false, error: `Invalid explorer_id: ${rawId}` };
+    }
 
-  // Convert display → onchain coords for the contract call
-  const targetCol = toContract(displayCol);
-  const targetRow = toContract(displayRow);
+    // Parse direction — accept number or string like "dir0", "0", "DIR_0", etc.
+    const rawDir = String(params.direction ?? "");
+    const direction = parseInt(rawDir.replace(/[^0-9]/g, ""), 10);
+    if (isNaN(direction) || direction < 0 || direction > 5) {
+      return { success: false, error: `direction must be 0-5. Got: ${rawDir}` };
+    }
 
-  // Find explorer's current position to compute direction
-  const worldState = await _worldStateProvider(client);
-  const explorer = worldState.entities.find((e) => e.entityId === explorerId && e.type === "army");
-  if (!explorer) {
-    return { success: false, error: `Explorer ${explorerId} not found in world state.` };
-  }
+    // Get current position to compute target tile coords for VRF seed
+    const worldState = await _worldStateProvider(client);
+    const explorer = worldState.entities.find((e) => e.entityId === explorerId && e.type === "army");
+    if (!explorer) {
+      return { success: false, error: `Explorer ${explorerId} not found in world state.` };
+    }
 
-  // Explorer position is onchain coords (from SQL coord_x/coord_y)
-  const fromCol = explorer.position.x;
-  const fromRow = explorer.position.y;
+    const fromCol = explorer.position.x;
+    const fromRow = explorer.position.y;
 
-  const direction = getDirectionBetweenAdjacentHexes({ col: fromCol, row: fromRow }, { col: targetCol, row: targetRow });
-  if (direction === undefined || direction === null || direction < 0) {
+    // Compute target tile coords from direction
+    const neighbors = getNeighborHexes(fromCol, fromRow);
+    const targetNeighbor = neighbors.find((n: any) => n.direction === direction);
+    if (!targetNeighbor) {
+      return { success: false, error: `Could not compute target tile for direction ${direction}` };
+    }
+    const targetCol = targetNeighbor.col;
+    const targetRow = targetNeighbor.row;
+
+    // Auto-detect explore: unexplored tile → explore=true (VRF), explored → explore=false (travel)
+    const targetTile = worldState.tileMap.get(`${targetCol},${targetRow}`);
+    const tileIsExplored = targetTile !== undefined && targetTile.biome !== 0;
+    const explore = params.explore !== undefined ? bool(params.explore) : !tileIsExplored;
+
+    const vrfSourceSalt = packTileSeed({ alt: false, col: targetCol, row: targetRow });
+
+    const result = await client.troops.move(signer as any, {
+      explorerId,
+      directions: [direction],
+      explore,
+      vrfSourceSalt,
+    });
+
+    const txHash = (result as any)?.transactionHash ?? (result as any)?.transaction_hash;
+    if (!txHash) {
+      return { success: false, error: `explorer_move failed: ${JSON.stringify(result)}` };
+    }
+
+    logAction("explorer_move", { success: true, txHash });
     return {
-      success: false,
-      error: `(${displayCol},${displayRow}) is not adjacent to current position. Move one tile at a time.`,
+      success: true,
+      txHash,
+      data: {
+        txHash,
+        explorerId,
+        direction,
+        from: `(${toDisplay(fromCol)},${toDisplay(fromRow)})`,
+        to: `(${toDisplay(targetCol)},${toDisplay(targetRow)})`,
+        explore,
+        note: explore ? "explored new tile" : "traveled to known tile",
+      },
     };
-  }
-
-  const vrfSourceSalt = packTileSeed({ alt: false, col: targetCol, row: targetRow });
-
-  const result = await client.troops.move(signer as any, {
-    explorerId,
-    directions: [direction],
-    explore,
-    vrfSourceSalt,
-  });
-
-  const txHash = (result as any)?.transactionHash ?? (result as any)?.transaction_hash;
-  if (!txHash) {
-    return { success: false, error: `move_to failed: ${JSON.stringify(result)}` };
-  }
-
-  logAction("move_to", { success: true, data: { txHash } });
-  return {
-    success: true,
-    data: { txHash, from: `(${toDisplay(fromCol)},${toDisplay(fromRow)})`, to: `(${displayCol},${displayRow})`, direction, explore },
-  };
   } catch (err: any) {
-    return { success: false, error: `move_to exception: ${err?.message ?? String(err)}` };
+    return { success: false, error: `explorer_move exception: ${err?.message ?? String(err)}` };
   }
 }
 
@@ -531,8 +589,8 @@ export function getActionHandler(
  */
 export async function executeAction(client: EternumClient, signer: Account, action: GameAction): Promise<ActionResult> {
   // Composite actions handled specially
-  if (action.type === "move_to") {
-    const result = await handleMoveTo(client, signer, action.params);
+  if (action.type === "explorer_move") {
+    const result = await handleExplorerMove(client, signer, action.params);
     logAction(action.type, result);
     return result;
   }
@@ -558,6 +616,30 @@ export async function executeAction(client: EternumClient, signer: Account, acti
 
   if (action.type === "settle_blitz_realm") {
     const result = await handleSettleBlitzRealm(signer, action.params);
+    logAction(action.type, result);
+    return result;
+  }
+
+  if (action.type === "run_smart_production") {
+    // Accept both camelCase and snake_case from agent
+    const realmEntityId = num(action.params.realmEntityId ?? action.params.realm_entity_id);
+
+    // Auto-detect produced resource IDs from world state if not provided
+    let producedResourceIds = (action.params.producedResourceIds as number[] | undefined);
+    if (!producedResourceIds || producedResourceIds.length === 0) {
+      if (_worldStateProvider) {
+        const worldState = await _worldStateProvider(client);
+        const realm = worldState.entities.find((e) => e.entityId === realmEntityId && e.type === "structure");
+        producedResourceIds = realm?.producedResourceIds ?? [];
+      }
+    }
+
+    const toriiUrl = _toriiSqlUrl ?? "";
+    if (!toriiUrl) {
+      return { success: false, error: "Torii SQL URL not configured. Pass toriiSqlUrl in initializeActions options." };
+    }
+
+    const result = await runSmartProduction(client, signer, realmEntityId, producedResourceIds ?? [], toriiUrl);
     logAction(action.type, result);
     return result;
   }

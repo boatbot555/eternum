@@ -29,13 +29,14 @@ export class EternumGameAdapter implements GameAdapter<EternumWorldState> {
     manifest?: Manifest,
     gameName?: string,
     tokenConfig?: TokenConfig,
+    toriiSqlUrl?: string,
   ) {
     // Enable move_to action with pathfinding by providing world state access
     setWorldStateProvider(accountAddress);
 
     // Initialize ABI-driven action registry from manifest
     if (manifest) {
-      initializeActions(manifest, signer, { gameName, tokenConfig });
+      initializeActions(manifest, signer, { gameName, tokenConfig, toriiSqlUrl });
     }
   }
 
