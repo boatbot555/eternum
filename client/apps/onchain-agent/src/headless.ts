@@ -3,7 +3,10 @@ import { createHeartbeatLoop, createGameAgent, type HeartbeatJob } from "@biblio
 import { getModel } from "@mariozechner/pi-ai";
 import { readFileSync, existsSync, readdirSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { Account, RpcProvider, uint256, CallData, type AccountInterface } from "starknet";
+import { Account, RpcProvider, uint256, CallData, hash, typedData, TypedDataRevision, encode, addAddressPadding, type AccountInterface } from "starknet";
+import { CartridgeSessionAccount } from "@cartridge/controller-wasm/session";
+import { ControllerFactory } from "@cartridge/controller-wasm";
+import "./session/browser-shims";
 import { createShutdownGate } from "./shutdown-gate";
 import { type AgentConfig, loadConfig } from "./config";
 import { EternumGameAdapter } from "./adapter/eternum-adapter";
@@ -222,42 +225,137 @@ export async function mainHeadless(options: CliOptions): Promise<void> {
       policies: sessionPolicies,
     });
 
-    // Try probe() first (uses SessionAccount WASM). If it crashes (starknet v8
-    // compatibility issue), fall back to constructing a raw Account from the
-    // stored session keypair — loses session/paymaster features but works.
+    // Check if session.json has authorization (from passwordLogin/createSession).
+    // If so, use CartridgeSessionAccount.new() directly — this path doesn't
+    // rely on on-chain registration lookup and is more reliable.
+    const sessionFilePath = path.join(sessionBasePath, "session.json");
+    let usedDirectSession = false;
+
     try {
-      const probed = await session.probe();
-      if (probed) {
-        account = probed;
-      } else {
-        // No cached session — can't do browser auth in headless mode
-        const authUrl = artifacts.auth?.url || "(run `axis auth " + options.world + "` to generate)";
-        emitter.emit({
-          type: "error",
-          message:
-            `No active session for ${options.world}. Auth required.\n` +
-            `  1. Open this URL in a browser: ${authUrl}\n` +
-            `  2. Approve the session\n` +
-            `  3. Run: axis auth ${options.world} --redirect-url="<redirect URL from browser>"`,
-        });
-        throw new Error(`No active session for ${options.world}. Run axis auth first.`);
+      const raw = readFileSync(sessionFilePath, "utf-8");
+      const data = JSON.parse(raw);
+      const signerData = typeof data.signer === "string" ? JSON.parse(data.signer) : data.signer;
+      const sessData = typeof data.session === "string" ? JSON.parse(data.session) : data.session;
+
+      emitter.emit({ type: "startup", message: `session.json check: address=${sessData.address}, auth=${!!sessData.authorization}, keys=${Object.keys(sessData).join(",")}` });
+      if (sessData.authorization && Array.isArray(sessData.authorization)) {
+        // Re-login via WASM to get a live Controller with wildcard session.
+        emitter.emit({ type: "startup", message: `Re-logging in via WASM for live Controller...` });
+
+        // ControllerFactory and browser-shims are statically imported at top
+
+        const cartridgePassword = process.env.CARTRIDGE_PASSWORD;
+        if (!cartridgePassword) {
+          throw new Error("CARTRIDGE_PASSWORD env var required for session execution");
+        }
+
+        // Read controller.json for username, address, classHash, ownerKey
+        const ctrlPath = path.join(sessionBasePath, "controller.json");
+        const authData = JSON.parse(readFileSync(ctrlPath, "utf-8"));
+        const csExpiresAtLogin = BigInt(Math.floor(Date.now() / 1000) + 7 * 24 * 3600);
+
+        emitter.emit({ type: "startup", message: `Login: user=${authData.username}, addr=${authData.address?.slice(0,12)}...` });
+        const loginResult = await ControllerFactory.login(
+          authData.username,
+          authData.classHash ?? "0x743c83c41ce99ad470aa308823f417b2141e02e04571f5c0004e743556e7faf",
+          config.rpcUrl,
+          authData.address,
+          { signer: { starknet: { privateKey: authData.ownerPrivateKey } } },
+          "https://api.cartridge.gg",
+          csExpiresAtLogin,
+          true,  // is_controller_registered
+          false, // create_wildcard_session — we'll call createSession explicitly
+          null,  // app_id
+        );
+        const controllerAccount = loginResult.intoValues()[0].intoAccount();
+
+        const wasmPolicies = [
+          ...Object.entries(sessionPolicies.contracts ?? {}).flatMap(
+            ([target, contract]: [string, any]) =>
+              contract.methods.map((m: any) => ({
+                target,
+                method: hash.getSelectorFromName(m.entrypoint),
+                authorized: true,
+              })),
+          ),
+          ...(sessionPolicies.messages ?? []).map((p: any) => {
+            const domainHash = typedData.getStructHash(p.types, "StarknetDomain", p.domain, TypedDataRevision.ACTIVE);
+            const typeHash = typedData.getTypeHash(p.types, p.primaryType, TypedDataRevision.ACTIVE);
+            return { scope_hash: hash.computePoseidonHash(domainHash, typeHash), authorized: true };
+          }),
+        ];
+
+        const csExpiresAt = BigInt(Math.floor(Date.now() / 1000) + 7 * 24 * 3600);
+        await controllerAccount.createSession("axis", wasmPolicies, csExpiresAt);
+        emitter.emit({ type: "startup", message: `Wildcard session created in live Controller` });
+
+        const sessionRpc = new RpcProvider({ nodeUrl: config.rpcUrl });
+        const sessionAccount = Object.create(sessionRpc) as AccountInterface;
+        sessionAccount.address = sessData.address;
+        (sessionAccount as any).execute = async (calls: any) => {
+          const normCalls = (Array.isArray(calls) ? calls : [calls]).map((c: any) => ({
+            entrypoint: c.entrypoint,
+            contractAddress: addAddressPadding(c.contractAddress),
+            calldata: CallData.toHex(c.calldata ?? []),
+          }));
+          try {
+            return await controllerAccount.executeFromOutsideV3(normCalls);
+          } catch (e1: any) {
+            try {
+              return await controllerAccount.executeFromOutsideV2(normCalls);
+            } catch (e2: any) {
+              const err1 = e1?.message ?? String(e1);
+              const err2 = e2?.message ?? String(e2);
+              throw new Error(`V3: ${err1.slice(0, 150)} | V2: ${err2.slice(0, 150)}`);
+            }
+          }
+        };
+
+        account = sessionAccount;
+        usedDirectSession = true;
+        emitter.emit({ type: "startup", message: "Using live Controller with wildcard session" });
       }
-    } catch (probeError) {
-      // SessionAccount WASM crashed — fall back to raw account from session.json
+    } catch (directErr) {
+      // Log error for debugging — fall through to probe()
       emitter.emit({
         type: "error",
-        message: `probe() failed: ${probeError instanceof Error ? (probeError.stack ?? probeError.message) : String(probeError)}`,
+        message: `Direct session setup failed: ${directErr instanceof Error ? directErr.message : String(directErr)} | stack: ${(directErr as any)?.stack?.slice(0, 300) ?? "none"}`,
       });
-      const sessionFilePath = path.join(sessionBasePath, "session.json");
+    }
+
+    if (!usedDirectSession) {
+      // Try probe() first (uses SessionAccount WASM newAsRegistered path).
       try {
-        const raw = readFileSync(sessionFilePath, "utf-8");
-        const data = JSON.parse(raw);
-        const signer = JSON.parse(data.signer);
-        const sess = JSON.parse(data.session);
-        account = createPrivateKeyAccount(config.rpcUrl, signer.privKey, sess.address);
-        emitter.emit({ type: "session", status: "active", message: "Using raw session keypair (WASM fallback)" });
-      } catch (fallbackErr) {
-        throw new Error(`Session probe failed and fallback failed: ${fallbackErr}`);
+        const probed = await session.probe();
+        if (probed) {
+          account = probed;
+        } else {
+          const authUrl = artifacts.auth?.url || "(run `axis auth " + options.world + "` to generate)";
+          emitter.emit({
+            type: "error",
+            message:
+              `No active session for ${options.world}. Auth required.\n` +
+              `  1. Open this URL in a browser: ${authUrl}\n` +
+              `  2. Approve the session\n` +
+              `  3. Run: axis auth ${options.world} --redirect-url="<redirect URL from browser>"`,
+          });
+          throw new Error(`No active session for ${options.world}. Run axis auth first.`);
+        }
+      } catch (probeError) {
+        emitter.emit({
+          type: "error",
+          message: `probe() failed: ${probeError instanceof Error ? (probeError.stack ?? probeError.message) : String(probeError)}`,
+        });
+        try {
+          const raw = readFileSync(sessionFilePath, "utf-8");
+          const data = JSON.parse(raw);
+          const signer = typeof data.signer === "string" ? JSON.parse(data.signer) : data.signer;
+          const sess = typeof data.session === "string" ? JSON.parse(data.session) : data.session;
+          account = createPrivateKeyAccount(config.rpcUrl, signer.privKey, sess.address);
+          emitter.emit({ type: "session", status: "active", message: "Using raw session keypair (WASM fallback)" });
+        } catch (fallbackErr) {
+          throw new Error(`Session probe failed and fallback failed: ${fallbackErr}`);
+        }
       }
     }
   }

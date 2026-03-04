@@ -9,7 +9,7 @@
  * In Node/Bun there is no `Window` class, so `instanceof Window` fails.
  * We define a minimal Window class and make our shim an instance of it.
  */
-const store = new Map<string, string>();
+export const store = new Map<string, string>();
 const localStorageShim = {
   getItem: (k: string) => store.get(k) ?? null,
   setItem: (k: string, v: string) => {

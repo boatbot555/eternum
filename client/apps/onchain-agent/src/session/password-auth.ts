@@ -5,10 +5,10 @@
  * ControllerFactory.login() via WASM, registers a session with
  * specific policies, and writes session.json for SessionProvider.
  */
-import "./browser-shims";
+import { store as browserShimStore } from "./browser-shims";
 import { writeFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { ec, stark, hash, encode } from "starknet";
+import { ec, stark, hash, encode, typedData, TypedDataRevision } from "starknet";
 import { ControllerFactory, signerToGuid } from "@cartridge/controller-wasm";
 
 const DEFAULT_CARTRIDGE_API_URL = "https://api.cartridge.gg";
@@ -139,22 +139,72 @@ async function getClassHash(rpcUrl: string, address: string): Promise<string> {
 // Convert axis SessionPolicies → WASM CallPolicy[]
 // ---------------------------------------------------------------------------
 
+interface MessagePolicy {
+  types: Record<string, { name: string; type: string }[]>;
+  primaryType: string;
+  domain: Record<string, unknown>;
+}
+
 type SessionPolicies = {
   contracts: Record<string, { methods: { entrypoint: string }[] }>;
-  messages?: unknown[];
+  messages?: MessagePolicy[];
 };
 
-function policiesToWasm(policies: SessionPolicies): { target: string; method: string }[] {
-  const result: { target: string; method: string }[] = [];
-  for (const [contractAddr, contract] of Object.entries(policies.contracts)) {
+/**
+ * Convert SessionPolicies to WASM Policy[] format.
+ * Must produce IDENTICAL output to toWasmPolicies() in @cartridge/controller
+ * (dist/node/index.js) — including the `authorized` field — so the policy
+ * hash at registration matches the hash used at execution time.
+ */
+function policiesToWasm(
+  policies: SessionPolicies,
+): Array<{ target: string; method: string; authorized: boolean } | { scope_hash: string; authorized: boolean }> {
+  const result: Array<
+    { target: string; method: string; authorized: boolean } | { scope_hash: string; authorized: boolean }
+  > = [];
+
+  // Contract policies (matches toWasmPolicies flatMap)
+  for (const [contractAddr, contract] of Object.entries(policies.contracts ?? {})) {
     for (const method of contract.methods) {
       result.push({
         target: contractAddr,
         method: hash.getSelectorFromName(method.entrypoint),
+        authorized: true,
       });
     }
   }
+
+  // Message signing policies (matches toWasmPolicies map)
+  if (policies.messages) {
+    for (const msg of policies.messages) {
+      const domainHash = typedData.getStructHash(
+        msg.types,
+        "StarknetDomain",
+        msg.domain,
+        TypedDataRevision.ACTIVE,
+      );
+      const typeHash = typedData.getTypeHash(msg.types, msg.primaryType, TypedDataRevision.ACTIVE);
+      result.push({
+        scope_hash: hash.computePoseidonHash(domainHash, typeHash),
+        authorized: true,
+      });
+    }
+  }
+
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: recursively find a "private_key" field in nested JSON
+// ---------------------------------------------------------------------------
+function findPrivateKey(obj: unknown): string | null {
+  if (!obj || typeof obj !== "object") return null;
+  for (const [k, v] of Object.entries(obj as Record<string, unknown>)) {
+    if (k === "private_key" && typeof v === "string" && v.startsWith("0x")) return v;
+    const found = findPrivateKey(v);
+    if (found) return found;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +215,7 @@ interface PasswordLoginOptions {
   username: string;
   password: string;
   rpcUrl: string;
+  chainId?: string;
   basePath: string;
   policies: SessionPolicies;
   apiUrl?: string;
@@ -176,6 +227,7 @@ export async function passwordLogin(options: PasswordLoginOptions): Promise<{ ad
     username,
     password,
     rpcUrl,
+    chainId,
     basePath,
     policies,
     apiUrl = DEFAULT_CARTRIDGE_API_URL,
@@ -193,7 +245,8 @@ export async function passwordLogin(options: PasswordLoginOptions): Promise<{ ad
   const sessionPrivKey = stark.randomAddress();
   const sessionPubKey = ec.starkCurve.getStarkKey(sessionPrivKey);
 
-  // 4. Login via WASM (no wildcard session — we register specific policies)
+  // 4. Login via WASM with wildcard session so createSession returns
+  //    a proper authorization proof for all policies
   const expiresAt = BigInt(Math.floor(Date.now() / 1000) + expiresInSecs);
   const loginResult = await ControllerFactory.login(
     username,
@@ -211,22 +264,62 @@ export async function passwordLogin(options: PasswordLoginOptions): Promise<{ ad
   const accountWithMeta = loginResult.intoValues()[0];
   const account = accountWithMeta.intoAccount();
 
-  // 5. Convert policies and register session
+  // 5. Convert policies and create authorized session
   const wasmPolicies = policiesToWasm(policies);
-  await account.registerSession("axis", wasmPolicies, expiresAt, sessionPubKey);
 
-  // 6. Compute guids for session storage
+  // Strategy: Use createSession to get an owner-signed authorization proof.
+  // createSession returns a wildcard session (allowedPoliciesRoot = "wildcard-policy").
+  // The WASM's SessionAccount skips Merkle proofs for wildcard sessions and just
+  // validates the owner's signature. No on-chain registration needed.
+
+  const csResult = await account.createSession("axis", wasmPolicies, expiresAt);
+
+  // Dump WASM's internal session data for debugging
+  for (const [k, v] of browserShimStore.entries()) {
+    if (k.startsWith("@cartridge/session")) {
+      console.error(`[password-auth] WASM session store: ${v}`);
+    }
+  }
+
+  // Extract the WASM's session key from in-memory localStorage
+  let wasmSessionPrivKey: string | null = null;
+  for (const [k, v] of browserShimStore.entries()) {
+    if (k.startsWith("@cartridge/session")) {
+      try {
+        const found = findPrivateKey(JSON.parse(v));
+        if (found) { wasmSessionPrivKey = found; break; }
+      } catch {}
+    }
+  }
+  if (!wasmSessionPrivKey) {
+    throw new Error("Could not extract WASM session private key from localStorage");
+  }
+  const wasmSessionPubKey = ec.starkCurve.getStarkKey(wasmSessionPrivKey);
+  console.error(`[password-auth] Extracted WASM session key, pubKey=${wasmSessionPubKey}`);
+
+  const sessionAuthorization = csResult?.authorization;
+  const allowedPoliciesRoot = csResult?.allowedPoliciesRoot ?? "0x0";
+  if (!sessionAuthorization || !Array.isArray(sessionAuthorization)) {
+    throw new Error("createSession did not return authorization");
+  }
+  console.error(`[password-auth] createSession OK: ${sessionAuthorization.length} auth elements, allowedPoliciesRoot=${allowedPoliciesRoot}`);
+
+  // 6. Use the WASM's session key (extracted above)
+  const finalPrivKey = wasmSessionPrivKey;
+  const finalPubKey = wasmSessionPubKey;
+
   const formattedOwnerPk = encode.addHexPrefix(ownerPublicKey);
-  const formattedSessionPk = encode.addHexPrefix(sessionPubKey);
   const ownerGuid = signerToGuid({ starknet: { privateKey: formattedOwnerPk } });
-  const sessionKeyGuid = signerToGuid({ starknet: { privateKey: formattedSessionPk } });
+  const sessionKeyGuid = csResult?.sessionKeyGuid
+    ? csResult.sessionKeyGuid
+    : signerToGuid({ starknet: { privateKey: encode.addHexPrefix(finalPubKey) } });
 
   // 7. Write session.json in NodeBackend format
   mkdirSync(basePath, { recursive: true });
   const sessionData = {
     signer: {
-      privKey: sessionPrivKey,
-      pubKey: sessionPubKey,
+      privKey: finalPrivKey,
+      pubKey: finalPubKey,
     },
     session: {
       address: address.toLowerCase(),
@@ -235,10 +328,23 @@ export async function passwordLogin(options: PasswordLoginOptions): Promise<{ ad
       guardianKeyGuid: "0x0",
       metadataHash: "0x0",
       expiresAt: Number(expiresAt),
+      ...(chainId ? { chainId } : {}),
+      policies: wasmPolicies,
+      allowedPoliciesRoot: allowedPoliciesRoot,
+      authorization: sessionAuthorization,
     },
   };
 
   writeFileSync(path.join(basePath, "session.json"), JSON.stringify(sessionData, null, 2));
+
+  // Write controller credentials for live Controller re-login during run
+  const controllerData = {
+    username,
+    address,
+    classHash,
+    ownerPrivateKey,
+  };
+  writeFileSync(path.join(basePath, "controller.json"), JSON.stringify(controllerData, null, 2));
 
   return { address };
 }

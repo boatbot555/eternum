@@ -116,7 +116,7 @@ export function getMapCenter(): number {
 }
 
 /** Convert contract coordinate to display coordinate. */
-function toDisplay(contractCoord: number): number {
+export function toDisplay(contractCoord: number): number {
   return contractCoord - getMapCenter();
 }
 

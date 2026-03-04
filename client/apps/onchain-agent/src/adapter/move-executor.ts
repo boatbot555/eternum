@@ -13,6 +13,7 @@ import type { ActionResult } from "@bibliothecadao/game-agent";
 import { findPath, type TileInfo, type PathResult, type ActionBatch } from "./pathfinder";
 import { executeAction } from "./action-registry";
 import type { EternumWorldState } from "./world-state";
+import { packTileSeed } from "@bibliothecadao/types";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -126,12 +127,18 @@ export async function moveExplorer(
 
     // Use the explorer_move ABI entrypoint directly.
     // The explore flag distinguishes travel (explore=false) from exploration (explore=true).
+    // For explore steps, pass vrf_source_salt = packTileSeed of the destination tile.
+    const isExplore = batch.type !== "travel";
+    const vrfSourceSalt = isExplore
+      ? packTileSeed({ alt: false, col: request.targetCol, row: request.targetRow })
+      : undefined;
     const result = await executeAction(client, signer, {
       type: "explorer_move",
       params: {
         explorer_id: request.explorerId,
         directions: batch.directions,
-        explore: batch.type !== "travel",
+        explore: isExplore,
+        ...(vrfSourceSalt !== undefined ? { vrf_source_salt: vrfSourceSalt.toString() } : {}),
       },
     });
     const actionType = batch.type === "travel" ? "travel" : "explore";

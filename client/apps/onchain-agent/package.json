@@ -7,7 +7,7 @@
     "dev": "source .env && NODE_OPTIONS='--experimental-wasm-modules --disable-warning=ExperimentalWarning' tsx src/cli.ts run",
     "doctor": "source .env && NODE_OPTIONS='--experimental-wasm-modules --disable-warning=ExperimentalWarning' tsx src/cli.ts doctor",
     "init": "source .env && NODE_OPTIONS='--experimental-wasm-modules --disable-warning=ExperimentalWarning' tsx src/cli.ts init",
-    "build:standalone": "bun run build.ts --compile",
+    "build:standalone": "pnpm --filter @bibliothecadao/types build && pnpm --filter @bibliothecadao/provider build && pnpm --filter @bibliothecadao/client build && bun run build.ts --compile",
     "package:release": "tsx src/release/package-release.ts",
     "build": "tsc --noEmit",
     "test": "vitest --run",

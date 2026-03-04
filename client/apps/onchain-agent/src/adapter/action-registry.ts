@@ -14,10 +14,10 @@ import type { Account } from "starknet";
 import { generateActions, mergeCompositeActions } from "../abi/action-gen";
 import { createABIExecutor, type ABIExecutor } from "../abi/executor";
 import { ETERNUM_OVERLAYS, createHiddenOverlays, num, bool, numArray, precisionAmount } from "../abi/domain-overlay";
-import { getDirectionBetweenAdjacentHexes } from "@bibliothecadao/types";
+import { getDirectionBetweenAdjacentHexes, packTileSeed } from "@bibliothecadao/types";
 import type { Manifest } from "../abi/types";
-import { moveExplorer } from "./move-executor";
-import { buildWorldState, type EternumWorldState, toContract, getMapCenter } from "./world-state";
+// move-executor removed (pathfinder removed)
+import { buildWorldState, type EternumWorldState, toContract, toDisplay, getMapCenter } from "./world-state";
 
 // ---------------------------------------------------------------------------
 // Module state — populated by initializeActions()
@@ -216,6 +216,7 @@ export function initializeActions(
 
   _actionDefs = withComposites.definitions;
   _actionTypes = new Set(withComposites.routes.keys());
+  _actionTypes.delete("explorer_move"); // Hidden — use move_to instead (handles VRF)
   _actionTypes.add("move_to"); // Not in routes (composite)
   _actionTypes.add("approve_token"); // Not in routes (composite)
   _actionTypes.add("lock_entry_token"); // Not in routes (composite)
@@ -241,38 +242,60 @@ async function handleMoveTo(
   params: Record<string, unknown>,
 ): Promise<ActionResult> {
   if (!_worldStateProvider) {
-    return { success: false, error: "World state provider not initialized. Call setWorldStateProvider first." };
+    return { success: false, error: "World state provider not initialized." };
   }
 
+  try {
+  const explorerId = num(params.explorerId);
+  const displayCol = num(params.targetCol);
+  const displayRow = num(params.targetRow);
+  const explore = bool(params.explore !== undefined ? params.explore : true);
+
+  // Convert display → onchain coords for the contract call
+  const targetCol = toContract(displayCol);
+  const targetRow = toContract(displayRow);
+
+  // Find explorer's current position to compute direction
   const worldState = await _worldStateProvider(client);
-
-  const targetCol = toContract(num(params.targetCol));
-  const targetRow = toContract(num(params.targetRow));
-
-  const result = await moveExplorer(
-    client,
-    signer,
-    {
-      explorerId: num(params.explorerId),
-      targetCol,
-      targetRow,
-    },
-    worldState,
-  );
-
-  if (!result.success) {
-    return { success: false, error: result.summary };
+  const explorer = worldState.entities.find((e) => e.entityId === explorerId && e.type === "army");
+  if (!explorer) {
+    return { success: false, error: `Explorer ${explorerId} not found in world state.` };
   }
 
+  // Explorer position is onchain coords (from SQL coord_x/coord_y)
+  const fromCol = explorer.position.x;
+  const fromRow = explorer.position.y;
+
+  const direction = getDirectionBetweenAdjacentHexes({ col: fromCol, row: fromRow }, { col: targetCol, row: targetRow });
+  if (direction === undefined || direction === null || direction < 0) {
+    return {
+      success: false,
+      error: `(${displayCol},${displayRow}) is not adjacent to current position. Move one tile at a time.`,
+    };
+  }
+
+  const vrfSourceSalt = packTileSeed({ alt: false, col: targetCol, row: targetRow });
+
+  const result = await client.troops.move(signer as any, {
+    explorerId,
+    directions: [direction],
+    explore,
+    vrfSourceSalt,
+  });
+
+  const txHash = (result as any)?.transactionHash ?? (result as any)?.transaction_hash;
+  if (!txHash) {
+    return { success: false, error: `move_to failed: ${JSON.stringify(result)}` };
+  }
+
+  logAction("move_to", { success: true, data: { txHash } });
   return {
     success: true,
-    data: {
-      summary: result.summary,
-      stepsExecuted: result.steps.length,
-      totalCost: result.pathResult.totalCost,
-      txHashes: result.steps.map((s) => s.result.txHash).filter(Boolean),
-    },
+    data: { txHash, from: `(${toDisplay(fromCol)},${toDisplay(fromRow)})`, to: `(${displayCol},${displayRow})`, direction, explore },
   };
+  } catch (err: any) {
+    return { success: false, error: `move_to exception: ${err?.message ?? String(err)}` };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -395,43 +418,7 @@ async function handleSettleBlitzRealm(signer: Account, params: Record<string, un
 // move_explorer handler — uses provider for explore (VRF multicall), ABI for travel
 // ---------------------------------------------------------------------------
 
-async function handleMoveExplorer(
-  client: EternumClient,
-  signer: Account,
-  params: Record<string, unknown>,
-): Promise<ActionResult> {
-  const explorerId = num(params.explorer_id ?? params.explorerId);
-  const directions = numArray(params.directions);
-  const explore = bool(params.explore);
 
-  if (!explorerId) {
-    return { success: false, error: "explorer_id is required" };
-  }
-  if (directions.length === 0) {
-    return { success: false, error: "directions must be a non-empty array" };
-  }
-
-  if (explore) {
-    // Explore requires VRF + move + extract_reward as a multicall.
-    // client.troops.explore() does this correctly via the provider.
-    try {
-      const result = await client.troops.explore(signer as any, {
-        explorerId,
-        directions,
-      });
-      const txHash = result?.transaction_hash ?? (result as any)?.transactionHash;
-      return { success: true, txHash };
-    } catch (err: any) {
-      return { success: false, error: err?.message ?? String(err) };
-    }
-  }
-
-  // Travel (explore=false) — single call, no VRF needed. Fall through to ABI executor.
-  if (!_executor) {
-    return { success: false, error: "Action registry not initialized." };
-  }
-  return _executor.execute({ type: "explorer_move", params });
-}
 
 // ---------------------------------------------------------------------------
 // add_to_explorer handler — auto-compute home_direction
@@ -546,13 +533,6 @@ export async function executeAction(client: EternumClient, signer: Account, acti
   // Composite actions handled specially
   if (action.type === "move_to") {
     const result = await handleMoveTo(client, signer, action.params);
-    logAction(action.type, result);
-    return result;
-  }
-
-  // explorer_move with explore=true needs VRF multicall via provider
-  if (action.type === "explorer_move" && bool(action.params.explore)) {
-    const result = await handleMoveExplorer(client, signer, action.params);
     logAction(action.type, result);
     return result;
   }

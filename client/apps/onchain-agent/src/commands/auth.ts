@@ -683,10 +683,12 @@ async function handlePasswordAuth(options: AuthOptions): Promise<number> {
 
       // Run password login
       const sessionBasePath = path.join(config.sessionBasePath, world.name);
+      const chainId = deriveChainIdFromRpcUrl(profile.rpcUrl ?? "") ?? config.chainId;
       const { address } = await passwordLogin({
         username: options.username,
         password: options.password,
         rpcUrl: profile.rpcUrl ?? config.rpcUrl,
+        chainId,
         basePath: sessionBasePath,
         policies: policies as { contracts: Record<string, { methods: { entrypoint: string }[] }> },
       });
